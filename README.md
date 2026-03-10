@@ -84,6 +84,4 @@ git clone https://github.com/<username>/csar-privacy-toolkit.git
 cd csar-privacy-toolkit
 cmake -B build
 cmake --build build -j$(nproc)
-
-
-
+```
