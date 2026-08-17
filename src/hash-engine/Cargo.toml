@@ -1,0 +1,10 @@
+[package]
+name = "hash-engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+hex = "0.4.3"
+image = "0.23.14"
+pdqhash = "0.1.1"
+serde = { version = "1.0.229", features = ["derive"] }
