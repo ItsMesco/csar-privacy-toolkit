@@ -1,12 +1,12 @@
+use image::EncodableLayout;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use image::EncodableLayout;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PdqHash(pub [u8; 32]);
 
 impl PdqHash {
-    pub fn to_hex(&self)->String {
+    pub fn to_hex(&self) -> String {
         hex::encode(self.0)
     }
 
@@ -27,52 +27,52 @@ impl PdqHash {
         Ok(PdqHash(arr))
     }
 
-    pub fn hamming_distance(&self, other: &PdqHash) ->u32{
+    pub fn hamming_distance(&self, other: &PdqHash) -> u32 {
         self.0
             .iter()
             .zip(other.0.iter())
-            .map(|(a,b)|(a^b).count_ones())
+            .map(|(a, b)| (a ^ b).count_ones())
             .sum()
     }
 }
 
 #[derive(Debug)]
-pub enum HashError{
+pub enum HashError {
     ImageLoad(image::ImageError),
     HashComputation(String),
 }
 
-impl std::fmt::Display for HashError{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>)-> std::fmt::Result{
-        match self{
-            HashError::ImageLoad(e)=>write!(f,"Errore caricamento immagine: {}", e),
+impl std::fmt::Display for HashError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HashError::ImageLoad(e) => write!(f, "Errore caricamento immagine: {}", e),
             HashError::HashComputation(e) => write!(f, "Errore calcolo hash PDQ: {}", e),
         }
     }
 }
 
-impl std::error::Error for HashError{}
+impl std::error::Error for HashError {}
 
-pub fn compute_pdq_from_path<P: AsRef<Path>>(path:P)-> Result<PdqHash, HashError>{
-    let img= image::open(path).map_err(HashError::ImageLoad)?;
+pub fn compute_pdq_from_path<P: AsRef<Path>>(path: P) -> Result<PdqHash, HashError> {
+    let img = image::open(path).map_err(HashError::ImageLoad)?;
     compute_pdq_from_image(&img)
 }
 
-pub fn compute_pdq_from_image(img: &image::DynamicImage)-> Result<PdqHash, HashError>{
+pub fn compute_pdq_from_image(img: &image::DynamicImage) -> Result<PdqHash, HashError> {
     let (hash, _quality) = pdqhash::generate_pdq(img)
         .ok_or_else(|| HashError::HashComputation("generate_pdq ha restituito None".to_string()))?;
 
     let bits = hash.as_bytes();
-    let mut arr = [0u8;32];
+    let mut arr = [0u8; 32];
     let len = bits.len().min(32);
     arr[..len].copy_from_slice(&bits[..len]);
 
     Ok(PdqHash(arr))
 }
 
-pub const DEF_MATCH_THRESHOLD: u32=31;
+pub const DEF_MATCH_THRESHOLD: u32 = 31;
 
-pub fn is_match(a: &PdqHash, b: &PdqHash, threshold: u32) -> bool{
+pub fn is_match(a: &PdqHash, b: &PdqHash, threshold: u32) -> bool {
     a.hamming_distance(b) <= threshold
 }
 

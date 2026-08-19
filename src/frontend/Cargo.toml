@@ -1,0 +1,41 @@
+[package]
+name = "frontend"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Hash engine condiviso (calcolo PDQ)
+hash-engine = { path = "../hash-engine" }
+ledger-core = { path = "../ledger-core" }
+
+# Perceptual hashing PDQ + decodifica immagini
+image = "0.23.14"
+pdqhash = "0.1.1"
+
+# Privacy Ledger / Merkle Tree (per verifica locale della membership prima di generare la ZKP)
+rs_merkle = "1.5"
+
+# Zero-Knowledge Proofs (arkworks / Groth16)
+ark-ff = { version = "0.6", default-features = false }
+ark-ec = { version = "0.6", default-features = false }
+ark-relations = { version = "0.6", default-features = false }
+ark-r1cs-std = { version = "0.6", default-features = false }
+ark-crypto-primitives = { version = "0.6", default-features = false, features = ["merkle_tree", "ark-r1cs-std", "crh", "sponge"] }
+ark-groth16 = { version = "0.6", default-features = false, features = ["r1cs"] }
+ark-bn254 = { version = "0.6", default-features = false, features = ["curve"] }
+ark-std = { version = "0.6", default-features = false, features = ["std"] }
+ark-serialize = "0.6"
+
+# Utility
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+hex = "0.4"
+
+# Networking verso il backend (invio ZKP, ricezione DB hash)
+reqwest = { version = "0.12", features = ["json"] }
+chrono = "0.4.45"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+
+[features]
+default = ["std"]
+std = ["ark-std/std", "ark-ff/std", "ark-ec/std"]
