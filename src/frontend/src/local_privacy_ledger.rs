@@ -1,8 +1,9 @@
 use chrono::{DateTime, Utc};
 use ledger_core::{hash_event, merkle_root, LedgerEvent};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;
+
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SourceCategory {
@@ -75,7 +76,6 @@ impl ClientAuditEvent {
 
 impl LedgerEvent for ClientAuditEvent {
 
-
     fn canonical_representation(&self) -> String {
         let mut representation = String::new();
 
@@ -118,6 +118,12 @@ impl LocalPrivacyLedger {
                 content_commitment TEXT NOT NULL,
                 schema_version     INTEGER NOT NULL,
                 leaf_hash          BLOB NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS ledger_checkpoints (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                merkle_root BLOB NOT NULL,
+                timestamp   TEXT NOT NULL
             );
             ",
         )?;
@@ -214,6 +220,60 @@ impl LocalPrivacyLedger {
         let leaves = self.event_leaves()?;
         Ok(merkle_root(&leaves))
     }
+
+    pub fn save_checkpoint(&self, root: [u8; 32]) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "
+            INSERT INTO ledger_checkpoints (merkle_root, timestamp)
+            VALUES (?1, ?2)
+            ",
+            params![root.to_vec(), Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_latest_checkpoint(&self) -> rusqlite::Result<Option<[u8; 32]>> {
+        self.conn
+            .query_row(
+                "
+                SELECT merkle_root
+                FROM ledger_checkpoints
+                ORDER BY id DESC
+                LIMIT 1
+                ",
+                [],
+                |row| {
+                    let blob: Vec<u8> = row.get(0)?;
+                    let root: [u8; 32] = blob.try_into().map_err(|_| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Blob,
+                            Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "merkle_root non ha lunghezza 32 byte",
+                            )),
+                        )
+                    })?;
+                    Ok(root)
+                },
+            )
+            .optional()
+    }
+
+    ///Return Ok(true) if root==checkpoint or there are no events or checkpoints
+    /// Returns Ok(false) if root!=checkpoint or if there are events but no checkpoints
+    pub fn verify_integrity(&self) -> rusqlite::Result<bool> {
+        let current_root = self.merkle_root()?;
+        let stored_root = self.get_latest_checkpoint()?;
+
+        match (current_root, stored_root) {
+            (None, None) => Ok(true),
+            (Some(root), Some(stored)) => Ok(root == stored),
+            (Some(_), None) => Ok(false),
+            (None, Some(_)) => Ok(false),
+        }
+    }
+
 }
 
 #[cfg(test)]
@@ -307,5 +367,63 @@ mod tests {
         let second_root = ledger.merkle_root().unwrap().unwrap();
 
         assert_ne!(first_root, second_root);
+    }
+
+    #[test]
+    fn verify_integrity_ok_after_checkpoint() {
+        let ledger = LocalPrivacyLedger::open(":memory:").unwrap();
+
+        let event = ClientAuditEvent::new(
+            "test-db-v1",
+            "db-root-123",
+            SourceCategory::TestFixture,
+            ScanOutcome::NoMatch,
+            "commitment-abc",
+        );
+
+        ledger.append_event(&event).unwrap();
+        let root = ledger.merkle_root().unwrap().unwrap();
+        ledger.save_checkpoint(root).unwrap();
+
+        assert!(ledger.verify_integrity().unwrap());
+    }
+
+    #[test]
+    fn verify_integrity_fails_on_tampered_leaf() {
+        let ledger = LocalPrivacyLedger::open(":memory:").unwrap();
+
+        let event = ClientAuditEvent::new(
+            "test-db-v1",
+            "db-root-123",
+            SourceCategory::TestFixture,
+            ScanOutcome::NoMatch,
+            "commitment-abc",
+        );
+
+        let id = ledger.append_event(&event).unwrap();
+        let root = ledger.merkle_root().unwrap().unwrap();
+        ledger.save_checkpoint(root).unwrap();
+
+        // Simuliamo una manomissione: alteriamo la leaf_hash direttamente nel DB
+        let mut fake_leaf = [0u8; 32];
+        fake_leaf[0] = 0xFF;
+
+        ledger
+            .conn
+            .execute(
+                "UPDATE client_audit_events SET leaf_hash = ?1 WHERE id = ?2",
+                params![fake_leaf.to_vec(), id],
+            )
+            .unwrap();
+
+        assert!(!ledger.verify_integrity().unwrap());
+    }
+
+    #[test]
+    fn verify_integrity_empty_ledger_no_checkpoint() {
+        let ledger = LocalPrivacyLedger::open(":memory:").unwrap();
+
+        // Ledger vuoto, nessun checkpoint: deve restituire true
+        assert!(ledger.verify_integrity().unwrap());
     }
 }
