@@ -4,7 +4,6 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;
 
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SourceCategory {
     Outgoing,
@@ -75,7 +74,6 @@ impl ClientAuditEvent {
 }
 
 impl LedgerEvent for ClientAuditEvent {
-
     fn canonical_representation(&self) -> String {
         let mut representation = String::new();
 
@@ -273,7 +271,6 @@ impl LocalPrivacyLedger {
             (None, Some(_)) => Ok(false),
         }
     }
-
 }
 
 #[cfg(test)]
