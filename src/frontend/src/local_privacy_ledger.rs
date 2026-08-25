@@ -400,8 +400,7 @@ mod tests {
         let id = ledger.append_event(&event).unwrap();
         let root = ledger.merkle_root().unwrap().unwrap();
         ledger.save_checkpoint(root).unwrap();
-
-        // Simuliamo una manomissione: alteriamo la leaf_hash direttamente nel DB
+        
         let mut fake_leaf = [0u8; 32];
         fake_leaf[0] = 0xFF;
 
@@ -419,8 +418,7 @@ mod tests {
     #[test]
     fn verify_integrity_empty_ledger_no_checkpoint() {
         let ledger = LocalPrivacyLedger::open(":memory:").unwrap();
-
-        // Ledger vuoto, nessun checkpoint: deve restituire true
+        
         assert!(ledger.verify_integrity().unwrap());
     }
 }

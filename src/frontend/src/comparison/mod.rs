@@ -1,4 +1,6 @@
 pub mod baseline_strategy;
+mod zkp_circuit;
+pub(crate) mod zkp_engine;
 
 use crate::local_privacy_ledger::ScanOutcome;
 use hash_engine::PdqHash;
