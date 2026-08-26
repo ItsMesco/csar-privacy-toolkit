@@ -1,4 +1,4 @@
-/src/target/
+src/target/
 **/target/
 build/
 **/build/
@@ -36,3 +36,13 @@ Thumbs.db
 *.synctex.gz
 *.csv
 demo_ledger.db
+certs/
+src/backend/certs/
+*.crt
+*.csr
+*.der
+*.p12
+*.pfx
+*.db-journal
+*.db-wal
+*.db-shm

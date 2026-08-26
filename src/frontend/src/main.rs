@@ -4,7 +4,7 @@ mod metrics;
 mod scanner;
 mod identity;
 
-use comparison::zkp_engine::{generate_proof, verify_proof, ZkpKeys};
+use comparison::zkp_engine::{generate_proof, ZkpKeys};
 use identity::InfractionIdentity;
 use local_privacy_ledger::{ClientAuditEvent, LocalPrivacyLedger, ScanOutcome, SourceCategory};
 use hash_engine::compute_pdq_from_path;
@@ -16,9 +16,13 @@ use rsa::{RsaPrivateKey, RsaPublicKey};
 use std::time::Instant;
 use std::fs; // Per leggere la dimensione dei file su disco
 use uuid::Uuid;
+use ark_serialize::CanonicalSerialize;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use reqwest::Client;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("==================================================");
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>>{
+println!("==================================================");
     println!("  Avvio Pipeline E2E (Real Math Execution)        ");
     println!("==================================================\n");
 
@@ -111,42 +115,74 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let time_batch = start_batch.elapsed();
     println!("      ✓ Pacchetto 2KB assemblato. Tempo: {:?}", time_batch);
 
-    // --- FASE 6: Verifica Server-Side (Il Verifier) ---
-    println!("[6/6] 🛡️ Verifica ZKP (Simulazione Server)...");
-    let start_verify = Instant::now();
+    //  FASE 6: Networking Reale (Invio al Backend)
+    println!("[6/6] ⚡ Invio Proof al Backend (Networking)...");
+    let start_net = Instant::now();
 
-    let is_valid = verify_proof(&zkp_keys, &proof, ref_hash, threshold)?;
+    // 1. Serializziamo la proof in byte
+    let mut proof_bytes = Vec::new();
+    proof.serialize_compressed(&mut proof_bytes)?;
+    let proof_b64 = BASE64.encode(&proof_bytes);
 
-    let time_verify = start_verify.elapsed();
-    if is_valid {
-        println!("      ✓ Il Server conferma: Prova ZKP VALIDA. Tempo: {:?}", time_verify);
+    // 2. Serializziamo la VERIFYING KEY (così il server può verificare)
+    let mut vk_bytes = Vec::new();
+    zkp_keys.verifying_key.serialize_compressed(&mut vk_bytes)?;
+    let vk_b64 = BASE64.encode(&vk_bytes);
+
+    let ref_hash_hex = hex::encode(ref_hash);
+
+    // 3. Payload con proof + verifying key
+    let payload = serde_json::json!({
+        "proof_b64": proof_b64,
+        "verifying_key_b64": vk_b64,
+        "reference_hash_hex": ref_hash_hex,
+        "threshold": threshold
+    });
+
+    // 4. Invio HTTP
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true) // solo per test con cert self-signed
+        .build()?;
+
+    let response = client.post("https://127.0.0.1:3000/api/v1/scan/zkp")
+        .header("Authorization", "Bearer super-secret-device-token-123")
+        .json(&payload)
+        .send()
+        .await?;
+
+    let status = response.status();
+    let response_text = response.text().await?;
+    let time_net = start_net.elapsed();
+
+    if status.is_success() {
+        println!("      ✅ Server risponde: {} - Tempo: {:?}", response_text, time_net);
     } else {
-        println!("      ❌ ERRORE: Prova ZKP Rifiutata!");
+        println!("      ❌ Errore dal server ({}): {}", status, response_text);
     }
 
     // 7. Misurazioni Finali di Sistema
-    let ram_peak = current_rss_kb(); // Fotografiamo la RAM alla fine del processo
-    let db_size = fs::metadata(db_path).map(|m| m.len()).unwrap_or(0); // Leggiamo i byte del DB
+    let ram_peak = current_rss_kb();
+    let db_path = "demo_ledger.db";
+    let db_size = fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
 
-    // --- REPORT FINALE ---
+    //  REPORT FINALE
     println!("\n==================================================");
-    println!("                REPORT PRESTAZIONI REALI          ");
+    println!("          REPORT PRESTAZIONI REALI          ");
     println!("==================================================");
-    println!("* Setup & Keygen (Una tantum) : {:?}", time_setup);
-    println!("* Hashing PDQ (Client)        : {:?}", time_hash);
-    println!("* ZKP Prove (Client)          : {:?}", time_zkp);
-    println!("* ZKP Verify (Server)         : {:?}", time_verify);
-    println!("* RSA-OAEP Encrypt            : {:?}", time_crypto);
-    println!("* SQLite / Merkle Tree        : {:?}", time_db);
-    println!("* Payload Normalization       : {:?}", time_batch);
+    println!("* Setup & Keygen (Una tantum): {:?}", time_setup);
+    println!("* Hashing PDQ (Client)       : {:?}", time_hash);
+    println!("* ZKP Prove (Client)         : {:?}", time_zkp);
+    println!("* RSA-OAEP Encrypt           : {:?}", time_crypto);
+    println!("* SQLite/ Merkle Tree        : {:?}", time_db);
+    println!("* Payload Normalization      : {:?}", time_batch);
+    println!("* Network RTT (Reqwest)      : {:?}", time_net);
     println!("--------------------------------------------------");
-    println!("* TEMPO TOTALE (E2E)          : {:?}", total_start.elapsed());
+    println!("* TEMPO TOTALE (E2E)         : {:?}", total_start.elapsed());
     println!("==================================================");
-    println!("* RAM Iniziale (OS base)      : {} KB (~{} MB)", ram_baseline, ram_baseline / 1024);
-    println!("* RAM Post-Setup (ZKP Keys)   : {} KB (~{} MB)", ram_after_setup, ram_after_setup / 1024);
-    println!("* RAM Picco / Finale          : {} KB (~{} MB)", ram_peak, ram_peak / 1024);
-    println!("* Spazio Disco SQLite         : {} Bytes (~{} KB)", db_size, db_size / 1024);
+    println!("* RAM Iniziale (OS base)     : {} KB (~{} MB)", ram_baseline, ram_baseline / 1024);
+    println!("* RAM Post-Setup (ZKP Keys)  : {} KB (~{} MB)", ram_after_setup, ram_after_setup / 1024);
+    println!("* RAM Picco / Finale         : {} KB (~{} MB)", ram_peak, ram_peak / 1024);
+    println!("* Spazio Disco SQLite        : {} Bytes (~{} KB)", db_size, db_size / 1024);
     println!("==================================================\n");
-
     Ok(())
 }
