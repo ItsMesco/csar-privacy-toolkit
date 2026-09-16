@@ -1,7 +1,7 @@
 // backend/src/main.rs
 mod server_audit;
-mod zkp_circuit;
-
+mod db_merkle;
+use crate::db_merkle::*;
 use axum::{
     extract::{FromRequestParts, State},
     http::{header, request::Parts, StatusCode},
@@ -24,7 +24,6 @@ use axum_server::tls_rustls::RustlsConfig;
 use std::net::SocketAddr;
 
 use server_audit::{AuditEvent, AuditEventType, PrivacyLedger};
-use zkp_circuit::HammingDistanceCircuit;
 
 // ─── Auth Extractor ───────────────────────────────────────────
 pub struct AuthToken;
@@ -71,6 +70,7 @@ struct ZkpScanResponse {
 #[derive(Clone)]
 struct AppState {
     ledger: Arc<Mutex<PrivacyLedger>>,
+    db_root: [u8; 32],
 }
 
 // ─── Main ─────────────────────────────────────────────────────
@@ -83,23 +83,25 @@ async fn main() {
     let ledger = PrivacyLedger::open("server_audit.db")
         .expect("Impossibile aprire il DB del server");
 
+    let db = published_db();
+    let db_root = db_merkle_root(&db);
     let start_event = AuditEvent::new(
         AuditEventType::DatabasePublished,
         "v1.0.0-csam-list",
-        "Server avviato.",
+        format!("root={}", hex::encode(db_root)),
     );
     ledger.append_event(&start_event).expect("Errore log avvio");
 
-    // Stato condiviso (solo ledger, niente più chiavi)
     let shared_state = Arc::new(AppState {
         ledger: Arc::new(Mutex::new(ledger)),
+        db_root,
     });
 
-    // Router
     let app = Router::new()
         .route("/api/v1/hashes/manifest", get(get_manifest))
         .route("/api/v1/hashes/download", get(download_db))
         .route("/api/v1/scan/zkp", post(handle_zkp_scan))
+        .route("/api/v1/scan/zkp-membership", post(handle_zkp_membership_scan))  // NEW
         .with_state(shared_state);
 
     // Carica i certificati TLS (percorsi fissi relativi alla cartella del backend)
@@ -276,12 +278,12 @@ struct DbManifest {
 
 async fn get_manifest(
     _auth: AuthToken,
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
 ) -> Json<DbManifest> {
     info!("🔍 Richiesta Manifest ricevuta");
     Json(DbManifest {
         version: "v1.0.0-csam-list".into(),
-        db_hash: "sha256-placeholder".into(),
+        db_hash: hex::encode(state.db_root),
     })
 }
 
@@ -291,15 +293,93 @@ async fn download_db(
     State(_state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
     info!("📥 Download DB richiesto");
+    let hashes: Vec<String> = published_db().iter().map(hex::encode).collect();
     let payload = serde_json::json!({
         "version": "v1.0.0-csam-list",
-        "hashes": [
-            "319016a7aab499193408ef3de4896df93ec84d5eea85c2e7af64726ea247ba05",
-            "f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0"
-        ]
+        "hashes": hashes,
     });
-    (
-        [(header::CONTENT_TYPE, "application/json")],
-        payload.to_string(),
-    )
+    ([(header::CONTENT_TYPE, "application/json")], payload.to_string())
+}
+
+fn decode_proof_and_vk(
+    proof_b64: &str,
+    vk_b64: &str,
+) -> Result<(Proof<Bn254>, VerifyingKey<Bn254>), String> {
+    let proof_bytes = BASE64.decode(proof_b64).map_err(|e| format!("Decodifica proof base64 fallita: {}", e))?;
+    let proof = Proof::<Bn254>::deserialize_compressed(&proof_bytes[..])
+        .map_err(|e| format!("Deserializzazione proof fallita: {}", e))?;
+    let vk_bytes = BASE64.decode(vk_b64).map_err(|e| format!("Decodifica VK base64 fallita: {}", e))?;
+    let vk = VerifyingKey::<Bn254>::deserialize_compressed(&vk_bytes[..])
+        .map_err(|e| format!("Deserializzazione Verifying Key fallita: {}", e))?;
+    Ok((proof, vk))
+}
+
+#[derive(Deserialize)]
+struct ZkpMembershipPayload {
+    proof_b64: String,
+    verifying_key_b64: String,
+    threshold: u32,
+}
+
+async fn handle_zkp_membership_scan(
+    _auth: AuthToken,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ZkpMembershipPayload>,
+) -> impl IntoResponse {
+    info!("📨 Ricevuta proof ZKP-membership. Verifica contro root pinnata...");
+    {
+        let ledger = state.ledger.lock().unwrap();
+        let _ = ledger.append_event(&AuditEvent::new(
+            AuditEventType::ProofReceived,
+            "v1.0.0-csam-list",
+            format!("strategy=zkp-membership threshold={}", payload.threshold),
+        ));
+    }
+
+    let (proof, verifying_key) = match decode_proof_and_vk(&payload.proof_b64, &payload.verifying_key_b64) {
+        Ok(x) => x,
+        Err(msg) => return (StatusCode::BAD_REQUEST, Json(ZkpScanResponse { valid: false, message: msg })),
+    };
+
+    // Public inputs: 256 bit della ROOT PINNATA + threshold.
+    // ⚠️ ORDINE BIT: LSB-first per byte (for i in 0..8), perché nel circuito
+    // membership la root è allocata con UInt8::new_input, che alloca i bit
+    // in ordine little-endian. Nell'endpoint direct-match invece è MSB-first.
+    let mut public_inputs: Vec<Fr> = Vec::with_capacity(257);
+    for byte in state.db_root.iter() {
+        for i in 0..8 {
+            let b = (byte >> i) & 1 == 1;
+            public_inputs.push(Fr::from(b as u64));
+        }
+    }
+    public_inputs.push(Fr::from(payload.threshold as u64));
+
+    let pvk = Groth16::<Bn254>::process_vk(&verifying_key)
+        .expect("Errore nel processare la verifying key");
+    let is_valid = Groth16::<Bn254>::verify_with_processed_vk(&pvk, &public_inputs, &proof)
+        .unwrap_or(false);
+
+    let event_type = if is_valid { AuditEventType::ProofVerified } else { AuditEventType::ProofRejected };
+    {
+        let ledger = state.ledger.lock().unwrap();
+        let _ = ledger.append_event(&AuditEvent::new(
+            event_type,
+            "v1.0.0-csam-list",
+            format!("strategy=zkp-membership valid={}", is_valid),
+        ));
+    }
+
+    if is_valid {
+        info!("✅ Proof membership VALIDA: appartenenza al DB committed confermata.");
+        (StatusCode::OK, Json(ZkpScanResponse {
+            valid: true,
+            message: "Proof verificata contro la root del database. Appartenenza confermata.".into(),
+        }))
+    } else {
+        info!("❌ Proof membership RIFIUTATA.");
+        (StatusCode::UNPROCESSABLE_ENTITY, Json(ZkpScanResponse {
+            valid: false,
+            message: "Proof non valida rispetto alla root del database committed.".into(),
+        }))
+    }
 }

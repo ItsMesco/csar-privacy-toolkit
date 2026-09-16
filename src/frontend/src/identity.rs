@@ -2,7 +2,6 @@ use rsa::{RsaPublicKey, Oaep};
 use rand::rngs::OsRng;
 use serde::{Serialize, Deserialize};
 use sha2::Sha256;
-use chrono::Utc;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct InfractionIdentity{

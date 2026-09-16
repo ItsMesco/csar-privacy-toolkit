@@ -44,10 +44,11 @@ impl PrivacyScanner {
         let image_hash = compute_pdq_from_path(path)?;
 
         let ctx = ComparisonContext {
-            reference_hash: *reference_hash,
+            reference_hash: *reference_hash,   // <-- asterisco qui
             threshold,
+            db_root: [0u8; 32],
+            merkle_path: Vec::new(),
         };
-
         let strategy_name = self.strategy.name();
         let strategy = &self.strategy;
 

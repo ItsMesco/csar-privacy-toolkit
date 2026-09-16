@@ -1,6 +1,10 @@
 pub mod baseline_strategy;
+pub mod zkp_strategy;
+pub mod zkp_membership_strategy;
 mod zkp_circuit;
 pub(crate) mod zkp_engine;
+pub(crate) mod zkp_membership_engine;
+mod zkp_membership_circuit;
 
 use crate::local_privacy_ledger::ScanOutcome;
 use hash_engine::PdqHash;
@@ -9,6 +13,10 @@ use hash_engine::PdqHash;
 pub struct ComparisonContext {
     pub reference_hash: PdqHash,
     pub threshold: u32,
+    // Dati necessari solo alla strategia con membership proof.
+    // Baseline e ZKP diretta li ignorano.
+    pub db_root: [u8; 32],
+    pub merkle_path: Vec<([u8; 32], bool)>,
 }
 
 #[derive(Debug)]
@@ -29,7 +37,6 @@ impl std::fmt::Display for ComparisonError {
         }
     }
 }
-
 impl std::error::Error for ComparisonError {}
 
 pub trait ComparisonStrategy {
@@ -40,14 +47,37 @@ pub trait ComparisonStrategy {
         local_hash: &PdqHash,
         context: &ComparisonContext,
     ) -> Result<ComparisonResult, ComparisonError>;
+
+    /// Verifica "lato server" della proof prodotta da compare().
+    /// Default: la strategia non produce proof.
+    fn verify(&self, proof: &[u8], context: &ComparisonContext) -> Result<bool, ComparisonError> {
+        let _ = (proof, context);
+        Err(ComparisonError::Internal(format!(
+            "La strategia '{}' non produce proof verificabili",
+            self.name()
+        )))
+    }
+
+    /// Verifying key serializzata, per il test E2E via backend.
+    fn verifying_key_bytes(&self) -> Option<Vec<u8>> {
+        None
+    }
 }
 
-pub fn build_strategy(mode: &str) -> Box<dyn ComparisonStrategy> {
+/// Il registry: main.rs non conosce le strategie, le chiede qui.
+pub fn available_strategies() -> &'static [&'static str] {
+    &["baseline", "zkp", "zkp-membership"]
+}
+
+pub fn build_strategy(
+    mode: &str,
+    db_len: usize,
+) -> Result<Box<dyn ComparisonStrategy>, ComparisonError> {
+    let depth = (db_len as u32).ilog2() as usize;
     match mode {
-        "baseline" => Box::new(baseline_strategy::BaselineStrategy),
-        other => panic!(
-            "Modalità sconosciuta: '{}'. Usa 'baseline' (phe/zkp arriveranno dopo).",
-            other
-        ),
+        "baseline" => Ok(Box::new(baseline_strategy::BaselineStrategy)),
+        "zkp" => Ok(Box::new(zkp_strategy::ZkpStrategy::new()?)),
+        "zkp-membership" => Ok(Box::new(zkp_membership_strategy::ZkpMembershipStrategy::new(depth)?)),
+        other => Err(ComparisonError::Internal(format!("Modalità sconosciuta: '{}'", other))),
     }
 }

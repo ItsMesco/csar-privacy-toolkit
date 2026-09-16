@@ -1,3 +1,5 @@
+pub mod db_merkle;
+
 use image::EncodableLayout;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
