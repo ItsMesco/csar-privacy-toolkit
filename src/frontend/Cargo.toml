@@ -24,6 +24,10 @@ ark-snark = "0.6"
 ark-bn254 = { version = "0.6", features = ["curve"] }
 ark-std = "0.6"
 
+#phe
+kzen-paillier = "0.4.3"
+curv-kzen = "0.10"
+
 # Utility
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
@@ -46,3 +50,5 @@ ark-crypto-primitives = { version = "0.6", features = ["crh", "constraints"] }
 [features]
 default = ["std"]
 std = ["ark-std/std", "ark-ff/std", "ark-ec/std"]
+
+

@@ -1,4 +1,4 @@
-use crate::comparison::{ComparisonContext, ComparisonStrategy};
+use crate::comparison::{ComparisonContext, ComparisonError, ComparisonStrategy};
 use crate::local_privacy_ledger::SourceCategory;
 use crate::local_privacy_ledger::{ClientAuditEvent, LocalPrivacyLedger, ScanOutcome};
 use crate::metrics::{measure, MetricsCollector};
@@ -20,12 +20,12 @@ impl PrivacyScanner {
         ledger_path: &str,
         database_version: &str,
         database_root: &str,
-        strategy: Box<dyn ComparisonStrategy>,
+        strategy: Result<Box<dyn ComparisonStrategy>, ComparisonError>,
     ) -> Result<Self, rusqlite::Error> {
         let ledger = LocalPrivacyLedger::open(ledger_path)?;
         Ok(Self {
             ledger,
-            strategy,
+            strategy: strategy?,
             metrics: MetricsCollector::new(),
             database_version: database_version.to_string(),
             database_root: database_root.to_string(),
@@ -106,7 +106,7 @@ mod tests {
         let ledger_path = temp_dir.join("test_scanner_ledger.db");
         let _ = fs::remove_file(&ledger_path);
 
-        let strategy = build_strategy("baseline");
+        let strategy = build_strategy("baseline", 100);
         let mut scanner = PrivacyScanner::new(
             ledger_path.to_str().unwrap(),
             "test-db-v1",

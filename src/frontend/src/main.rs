@@ -42,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_root = db_merkle_root(&db);
     let context = ComparisonContext {
         reference_hash: PdqHash(db[matched_index]),
-        threshold: 31,
+        threshold: 30,
         db_root,
         merkle_path: merkle_path(&db, matched_index),
     };

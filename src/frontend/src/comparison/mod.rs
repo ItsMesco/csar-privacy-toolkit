@@ -5,6 +5,8 @@ mod zkp_circuit;
 pub(crate) mod zkp_engine;
 pub(crate) mod zkp_membership_engine;
 mod zkp_membership_circuit;
+mod phe_engine;
+mod phe_strategy;
 
 use crate::local_privacy_ledger::ScanOutcome;
 use hash_engine::PdqHash;
@@ -38,7 +40,11 @@ impl std::fmt::Display for ComparisonError {
     }
 }
 impl std::error::Error for ComparisonError {}
-
+impl From<ComparisonError> for rusqlite::Error {
+    fn from(err: ComparisonError) -> Self {
+        rusqlite::Error::ToSqlConversionFailure(Box::new(err))
+    }
+}
 pub trait ComparisonStrategy {
     fn name(&self) -> &'static str;
 
@@ -66,7 +72,7 @@ pub trait ComparisonStrategy {
 
 /// Il registry: main.rs non conosce le strategie, le chiede qui.
 pub fn available_strategies() -> &'static [&'static str] {
-    &["baseline", "zkp", "zkp-membership"]
+    &["baseline", "zkp", "zkp-membership", "phe"]
 }
 
 pub fn build_strategy(
@@ -78,6 +84,8 @@ pub fn build_strategy(
         "baseline" => Ok(Box::new(baseline_strategy::BaselineStrategy)),
         "zkp" => Ok(Box::new(zkp_strategy::ZkpStrategy::new()?)),
         "zkp-membership" => Ok(Box::new(zkp_membership_strategy::ZkpMembershipStrategy::new(depth)?)),
+        "phe" => Ok(Box::new(phe_strategy::PheStrategy::new(2048))),
         other => Err(ComparisonError::Internal(format!("Modalità sconosciuta: '{}'", other))),
     }
 }
+
