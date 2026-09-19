@@ -118,46 +118,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("      ledger          : {:?}", time_db);
 
         // 5. Network (endpoint dedicato per ogni strategia ZKP)
+        // 5. Network (endpoint dedicato per ogni strategia)
+        // 5. Network (endpoint dedicato per ogni strategia)
         let mut time_net: Option<Duration> = None;
-        if let (Some(proof_bytes), Some(vk_bytes)) = (&result.proof, strategy.verifying_key_bytes()) {
-            let (url, payload) = match *mode {
-                "zkp" => (
-                    "https://127.0.0.1:3000/api/v1/scan/zkp",
-                    serde_json::json!({
-                        "proof_b64": BASE64.encode(proof_bytes),
-                        "verifying_key_b64": BASE64.encode(&vk_bytes),
-                        "reference_hash_hex": hex::encode(context.reference_hash.0),
-                        "threshold": context.threshold,
-                    }),
-                ),
-                "zkp-membership" => (
-                    "https://127.0.0.1:3000/api/v1/scan/zkp-membership",
-                    serde_json::json!({
-                        "proof_b64": BASE64.encode(proof_bytes),
-                        "verifying_key_b64": BASE64.encode(&vk_bytes),
-                        "threshold": context.threshold,
-                    }),
-                ),
-                _ => unreachable!(),
+        if let Some(proof_bytes) = &result.proof {
+            // Costruiamo il builder della richiesta in base alla modalità
+            let req_builder = match *mode {
+                "zkp" => {
+                    if let Some(vk_bytes) = strategy.verifying_key_bytes() {
+                        Some(reqwest::Client::builder()
+                            .danger_accept_invalid_certs(true)
+                            .build()?
+                            .post("https://127.0.0.1:3000/api/v1/scan/zkp")
+                            .json(&serde_json::json!({
+                                "proof_b64": BASE64.encode(proof_bytes),
+                                "verifying_key_b64": BASE64.encode(&vk_bytes),
+                                "reference_hash_hex": hex::encode(context.reference_hash.0),
+                                "threshold": context.threshold,
+                            })))
+                    } else { None }
+                }
+                "zkp-membership" => {
+                    if let Some(vk_bytes) = strategy.verifying_key_bytes() {
+                        Some(reqwest::Client::builder()
+                            .danger_accept_invalid_certs(true)
+                            .build()?
+                            .post("https://127.0.0.1:3000/api/v1/scan/zkp-membership")
+                            .json(&serde_json::json!({
+                                "proof_b64": BASE64.encode(proof_bytes),
+                                "verifying_key_b64": BASE64.encode(&vk_bytes),
+                                "threshold": context.threshold,
+                            })))
+                    } else { None }
+                }
+                "phe" => {
+                    // Per PHE, il Client invia i ciphertext e la dk (solo per questo test E2E)
+                    if let Some(dk_bytes) = strategy.decryption_key_bytes() {
+                        Some(reqwest::Client::builder()
+                            .danger_accept_invalid_certs(true)
+                            .build()?
+                            .post("https://127.0.0.1:3000/api/v1/scan/phe")
+                            .json(&serde_json::json!({
+                                "ciphertexts_b64": BASE64.encode(proof_bytes),
+                                "decryption_key_b64": BASE64.encode(&dk_bytes),
+                                "reference_hash_hex": hex::encode(context.reference_hash.0),
+                                "threshold": context.threshold,
+                            })))
+                    } else { None }
+                }
+                _ => None,
             };
 
-            let start_net = Instant::now();
-            let client = reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
-                .build()?;
-            match client
-                .post(url)
-                .header("Authorization", "Bearer super-secret-device-token-123")
-                .json(&payload)
-                .send()
-                .await
-            {
-                Ok(resp) => {
-                    let e = start_net.elapsed();
-                    time_net = Some(e);
-                    println!("      network (RTT)   : {:?}  | backend={}", e, resp.status());
+            // Se siamo riusciti a costruire la richiesta, inviamola
+            if let Some(builder) = req_builder {
+                let start_net = Instant::now();
+                match builder
+                    .header("Authorization", "Bearer super-secret-device-token-123")
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        let e = start_net.elapsed();
+                        time_net = Some(e);
+                        let status = resp.status();
+                        if status.is_success() {
+                            println!("      network (RTT)   : {:?}  | backend={}", e, status);
+                        } else {
+                            let err_text = resp.text().await.unwrap_or_else(|_| "<nessun corpo>".into());
+                            println!("      network (RTT)   : {:?}  | backend={} | ERR: {}", e, status, err_text);
+                        }
+                    }
+                    Err(e) => println!("      network (RTT)   : ---  (backend irraggiungibile: {})", e),
                 }
-                Err(e) => println!("      network (RTT)   : ---  (backend irraggiungibile: {})", e),
+            } else {
+                println!("      network (RTT)   : ---  (chiavi di verifica/decifrazione mancanti)");
             }
         } else {
             println!("      network (RTT)   : ---  (no proof to send)");

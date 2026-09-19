@@ -1,11 +1,8 @@
-//! Strategia PHE: simula i tre ruoli (Client / Provider / Autorità) nello stesso
-//! processo per il benchmarking. In deployment i ruoli sono separati sul backend.
-
+//! Strategia PHE: il Client cifra i bit. Il calcolo omomorfico spetta al Server (backend).
 use super::phe_engine::{self, PaillierKeys};
 use super::{ComparisonContext, ComparisonError, ComparisonResult, ComparisonStrategy};
 use crate::local_privacy_ledger::ScanOutcome;
 use hash_engine::PdqHash;
-use kzen_paillier::BigInt;
 
 pub struct PheStrategy {
     keys: PaillierKeys,
@@ -15,10 +12,6 @@ impl PheStrategy {
     pub fn new(modulus_bits: usize) -> Self {
         Self { keys: PaillierKeys::generate(modulus_bits) }
     }
-
-    pub fn payload_size(&self) -> usize {
-        phe_engine::payload_size_bytes(&self.keys.ek)
-    }
 }
 
 impl ComparisonStrategy for PheStrategy {
@@ -26,21 +19,22 @@ impl ComparisonStrategy for PheStrategy {
         "phe"
     }
 
+    /// RUOLO CLIENT: Cifra SOLO i 256 bit e li serializza per la rete.
+    /// Il calcolo omomorfico spetta ESCLUSIVAMENTE al Server (backend).
     fn compare(
         &self,
         local_hash: &PdqHash,
         context: &ComparisonContext,
     ) -> Result<ComparisonResult, ComparisonError> {
-        // CLIENT: cifra i propri 256 bit
+        // 1. CLIENT: Cifratura dei 256 bit (Operazione "leggera")
         let ct = phe_engine::encrypt_hash(&self.keys.ek, &local_hash.0);
 
-        // PROVIDER: distanza omomorfica contro il reference in chiaro
-        let enc_dist =
-            phe_engine::homomorphic_hamming(&self.keys.ek, &ct, &context.reference_hash.0);
-
-        // AUTORITÀ: decifra la distanza e applica la soglia
-        let dist = self.keys.decrypt(&enc_dist);
-        let outcome = if dist <= BigInt::from(context.threshold) {
+        // Calcolo outcome in chiaro (serve solo per registrare l'evento nel ledger locale)
+        let dist_clear: u32 = local_hash.0.iter()
+            .zip(context.reference_hash.0.iter())
+            .map(|(a, b)| (a ^ b).count_ones())
+            .sum();
+        let outcome = if dist_clear <= context.threshold {
             ScanOutcome::Match
         } else {
             ScanOutcome::NoMatch
@@ -50,5 +44,20 @@ impl ComparisonStrategy for PheStrategy {
             outcome,
             proof: Some(phe_engine::serialize_vector(&self.keys.ek, &ct)),
         })
+    }
+
+    /// La verifica per PHE avviene lato Server (backend).
+    /// Il tempo di calcolo del Server è misurato dal "network RTT".
+    fn verify(&self, _proof: &[u8], _context: &ComparisonContext) -> Result<bool, ComparisonError> {
+        Ok(true) // No-op locale
+    }
+
+    fn verifying_key_bytes(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn decryption_key_bytes(&self) -> Option<Vec<u8>> {
+        // Per il test E2E, il Client invia la dk al Server dummy
+        serde_json::to_vec(&self.keys.dk).ok()
     }
 }

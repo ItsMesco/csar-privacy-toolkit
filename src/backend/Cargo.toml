@@ -23,16 +23,16 @@ chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
 
 # --- Dipendenze per la verifica ZKP (Groth16) ---
-ark-ff = "0.6"
-ark-ec = "0.6"
 ark-groth16 = "0.6"
 ark-snark = "0.6"
 ark-bn254 = { version = "0.6", features = ["curve"] }
-ark-std = "0.6"
+
 ark-serialize = "0.6"
-ark-r1cs-std = "0.6"
-ark-relations = "0.6"
+
 
 
 base64 = "0.23.0"
 rand = "0.8"
+
+kzen-paillier = "0.4.3"
+curv-kzen = "0.10"

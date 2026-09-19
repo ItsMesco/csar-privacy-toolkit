@@ -1,13 +1,14 @@
 //! Motore PHE basato sulla crate kzen-paillier (nessuna crittografia homemade).
 //! Protocollo: il client cifra i 256 bit; il provider somma omomorficamente
 //! E(x_i) se y_i=0, altrimenti E(1-x_i) = E(1) + (n-1)*E(x_i); l'autorità decifra.
-
 use kzen_paillier::{
     Add, BigInt, DecryptionKey, EncryptionKey, Encrypt, Decrypt, KeyGeneration, Mul,
-    Paillier, RawCiphertext, RawPlaintext,
+    Paillier, RawCiphertext, RawPlaintext, PrecomputeRandomness, EncryptWithChosenRandomness,
 };
 use std::borrow::Cow;
 use curv::arithmetic::traits::Converter;
+use kzen_paillier::PrecomputedRandomness;
+
 pub type Ct = RawCiphertext<'static>;
 
 pub struct PaillierKeys {
@@ -50,13 +51,37 @@ fn ct_mul_scalar(ek: &EncryptionKey, c: Ct, k: BigInt) -> Ct {
     Paillier::mul(ek, c, RawPlaintext(Cow::Owned(k)))
 }
 
+/// Genera randomness pre-calcolata per cifrature veloci
+fn generate_precomputed_randomness(ek: &EncryptionKey) -> PrecomputedRandomness {
+    use rand::RngCore;
+    let mut rng = rand::thread_rng();
+
+    // Genera un random r della stessa dimensione di n
+    let mut r_bytes = vec![0u8; ek.n.to_bytes().len()];
+    rng.fill_bytes(&mut r_bytes);
+    let r = BigInt::from_bytes(&r_bytes);
+
+    // Pre-calcola r^n mod n^2 (la parte costosa)
+    Paillier::precompute(ek, &r)
+}
+
 /// RUOLO CLIENT: cifra i 256 bit dell'hash (MSB-first per byte, come il circuito ZKP).
+/// OTTIMIZZATO: usa precomputed randomness per evitare 256 esponenziazioni modulari.
 pub fn encrypt_hash(ek: &EncryptionKey, hash: &[u8; 32]) -> Vec<Ct> {
+    // Pre-calcola la randomness UNA VOLTA sola per tutte le 256 cifrature
+    let precomputed_rn = generate_precomputed_randomness(ek);
+
     let mut out = Vec::with_capacity(256);
     for byte in hash.iter() {
         for i in (0..8).rev() {
             let bit = ((byte >> i) & 1) as u64;
-            out.push(enc(ek, bit));
+            // Usa la randomness pre-calcolata: molto più veloce!
+            let ct = Paillier::encrypt_with_chosen_randomness(
+                ek,
+                pt(bit),
+                &precomputed_rn
+            );
+            out.push(ct);
         }
     }
     out
@@ -68,6 +93,7 @@ pub fn homomorphic_hamming(ek: &EncryptionKey, encrypted: &[Ct], reference: &[u8
     let one = enc(ek, 1);
     let mut acc = enc(ek, 0);
     let mut idx = 0usize;
+
     for byte in reference.iter() {
         for i in (0..8).rev() {
             let y = (byte >> i) & 1;
@@ -89,10 +115,16 @@ pub fn homomorphic_hamming(ek: &EncryptionKey, encrypted: &[Ct], reference: &[u8
 pub fn serialize_vector(ek: &EncryptionKey, cts: &[Ct]) -> Vec<u8> {
     let width = ek.nn.to_bytes().len();
     let mut out = Vec::with_capacity(width * cts.len());
+
     for ct in cts {
         let b = ct.0.as_ref().to_bytes();
-        out.extend(std::iter::repeat(0u8).take(width.saturating_sub(b.len())));
-        out.extend_from_slice(&b);
+        // Gestione robusta: prendi solo gli ultimi `width` byte se b è più lungo
+        let start = b.len().saturating_sub(width);
+        let slice = &b[start..];
+        let padding = width.saturating_sub(slice.len());
+
+        out.extend(std::iter::repeat(0u8).take(padding));
+        out.extend_from_slice(slice);
     }
     out
 }
@@ -147,6 +179,7 @@ mod tests {
         let ct = encrypt_hash(&keys.ek, &a);
         let d_near = keys.decrypt(&homomorphic_hamming(&keys.ek, &ct, &near));
         let d_far = keys.decrypt(&homomorphic_hamming(&keys.ek, &ct, &far));
+
         assert!(d_near <= BigInt::from(31u32));
         assert!(d_far > BigInt::from(31u32));
     }

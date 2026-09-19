@@ -68,6 +68,11 @@ pub trait ComparisonStrategy {
     fn verifying_key_bytes(&self) -> Option<Vec<u8>> {
         None
     }
+
+    /// Decryption key serializzata, SOLO per il test E2E della strategia PHE.
+    fn decryption_key_bytes(&self) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 /// Il registry: main.rs non conosce le strategie, le chiede qui.

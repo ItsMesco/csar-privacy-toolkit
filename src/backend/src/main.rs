@@ -24,6 +24,9 @@ use axum_server::tls_rustls::RustlsConfig;
 use std::net::SocketAddr;
 
 use server_audit::{AuditEvent, AuditEventType, PrivacyLedger};
+use curv::arithmetic::traits::Converter;
+use kzen_paillier::{Add, BigInt, DecryptionKey, Decrypt, EncryptionKey, Encrypt, Mul, Paillier, RawCiphertext, RawPlaintext};
+use std::borrow::Cow;
 
 // ─── Auth Extractor ───────────────────────────────────────────
 pub struct AuthToken;
@@ -101,7 +104,8 @@ async fn main() {
         .route("/api/v1/hashes/manifest", get(get_manifest))
         .route("/api/v1/hashes/download", get(download_db))
         .route("/api/v1/scan/zkp", post(handle_zkp_scan))
-        .route("/api/v1/scan/zkp-membership", post(handle_zkp_membership_scan))  // NEW
+        .route("/api/v1/scan/zkp-membership", post(handle_zkp_membership_scan))
+        .route("/api/v1/scan/phe", post(handle_phe_scan))
         .with_state(shared_state);
 
     // Carica i certificati TLS (percorsi fissi relativi alla cartella del backend)
@@ -380,6 +384,150 @@ async fn handle_zkp_membership_scan(
         (StatusCode::UNPROCESSABLE_ENTITY, Json(ZkpScanResponse {
             valid: false,
             message: "Proof non valida rispetto alla root del database committed.".into(),
+        }))
+    }
+}
+#[derive(Deserialize)]
+struct PheScanPayload {
+    ciphertexts_b64: String,
+    decryption_key_b64: String, // <-- Ricevuta dal client per il test
+    reference_hash_hex: String,
+    threshold: u32,
+}
+
+async fn handle_phe_scan(
+    _auth: AuthToken,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<PheScanPayload>,
+) -> impl IntoResponse {
+    info!("📨 Ricevuto ciphertext PHE. Decifrazione e verifica in corso...");
+
+    {
+        let ledger = state.ledger.lock().unwrap();
+        let _ = ledger.append_event(&AuditEvent::new(
+            AuditEventType::ProofReceived,
+            "v1.0.0-csam-list",
+            format!("strategy=phe threshold={}", payload.threshold),
+        ));
+    }
+
+    // 1. Decodifica e deserializza la DecryptionKey
+    let dk_bytes = match BASE64.decode(&payload.decryption_key_b64) {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(ZkpScanResponse { valid: false, message: format!("Decodifica DK base64 fallita: {}", e) })),
+    };
+    let dk: DecryptionKey = match serde_json::from_slice(&dk_bytes) {
+        Ok(k) => k,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(ZkpScanResponse { valid: false, message: format!("Deserializzazione DK fallita: {}", e) })),
+    };
+
+    // 3. Decodifica i ciphertext
+    let ct_bytes = match BASE64.decode(&payload.ciphertexts_b64) {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(ZkpScanResponse { valid: false, message: format!("Decodifica ciphertext base64 fallita: {}", e) })),
+    };
+
+    // 4. Ricostruisci la EncryptionKey dalla DecryptionKey
+    let n = &dk.p * &dk.q;
+    let nn = &n * &n;
+    let ek = EncryptionKey { n, nn };
+
+    let expected_width = ek.nn.to_bytes().len();
+    let expected_total = expected_width * 256;
+
+    // VALIDAZIONE RIGOROSA: la lunghezza deve essere ESATTAMENTE quella attesa.
+    if ct_bytes.len() != expected_total {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ZkpScanResponse {
+                valid: false,
+                message: format!("Dimensione ciphertext non valida: attesi {} byte, ricevuti {} byte", expected_total, ct_bytes.len())
+            }),
+        );
+    }
+
+    // 5. Deserializza i 256 ciphertext in modo deterministico
+    let mut cts: Vec<RawCiphertext<'static>> = Vec::with_capacity(256);
+    for i in 0..256 {
+        let start = i * expected_width;
+        let end = start + expected_width;
+        let b = &ct_bytes[start..end];
+        let n_val = BigInt::from_bytes(b);
+        cts.push(RawCiphertext(Cow::Owned(n_val)));
+    }
+
+    // 5. Decodifica l'hash di riferimento
+    let ref_bytes = match hex::decode(&payload.reference_hash_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return (StatusCode::BAD_REQUEST, Json(ZkpScanResponse { valid: false, message: "Hash di riferimento non valido".into() })),
+    };
+
+    // 6. Helper functions per operazioni omomorfiche con lifetime 'static
+    fn clone_ct(c: &RawCiphertext<'_>) -> RawCiphertext<'static> {
+        RawCiphertext(Cow::Owned(c.0.as_ref().clone()))
+    }
+    fn ct_add(ek: &EncryptionKey, a: RawCiphertext<'static>, b: RawCiphertext<'static>) -> RawCiphertext<'static> {
+        Paillier::add(ek, a, b)
+    }
+    fn ct_mul_scalar(ek: &EncryptionKey, c: RawCiphertext<'static>, k: BigInt) -> RawCiphertext<'static> {
+        Paillier::mul(ek, c, RawPlaintext(Cow::Owned(k)))
+    }
+    fn enc(ek: &EncryptionKey, v: u64) -> RawCiphertext<'static> {
+        Paillier::encrypt(ek, RawPlaintext(Cow::Owned(BigInt::from(v))))
+    }
+
+    // 7. Calcolo distanza di Hamming omomorfica (identico al frontend)
+    let n_minus_1 = ek.n.clone() - BigInt::from(1u32);
+    let one = enc(&ek, 1);
+    let mut acc = enc(&ek, 0);
+    let mut idx = 0usize;
+
+    for byte in ref_bytes.iter() {
+        for i in (0..8).rev() {
+            let y = (byte >> i) & 1;
+            let factor = if y == 0 {
+                clone_ct(&cts[idx])
+            } else {
+                let neg = ct_mul_scalar(&ek, clone_ct(&cts[idx]), n_minus_1.clone());
+                ct_add(&ek, clone_ct(&one), neg)
+            };
+            acc = ct_add(&ek, acc, factor);
+            idx += 1;
+        }
+    }
+
+    // 8. Decifra il risultato finale
+    let pt_result: RawPlaintext<'static> = Paillier::decrypt(&dk, &acc);
+    let dist = pt_result.0.into_owned(); // Ottiene direttamente il BigInt
+
+    let is_match = dist <= BigInt::from(payload.threshold as u64);
+
+    // 9. Log e risposta
+    let event_type = if is_match { AuditEventType::ProofVerified } else { AuditEventType::ProofRejected };
+    {
+        let ledger = state.ledger.lock().unwrap();
+        let _ = ledger.append_event(&AuditEvent::new(
+            event_type,
+            "v1.0.0-csam-list",
+            format!("strategy=phe distance={} threshold={} match={}", dist, payload.threshold, is_match),
+        ));
+    }
+
+    if is_match {
+        info!("✅ Distanza PHE: {} <= {} → MATCH confermato.", dist, payload.threshold);
+        (StatusCode::OK, Json(ZkpScanResponse {
+            valid: true,
+            message: format!("Distanza di Hamming: {} (soglia: {}). Match confermato.", dist, payload.threshold),
+        }))
+    } else {
+        info!("❌ Distanza PHE: {} > {} → NO MATCH.", dist, payload.threshold);
+        (StatusCode::UNPROCESSABLE_ENTITY, Json(ZkpScanResponse {
+            valid: false,
+            message: format!("Distanza di Hamming: {} (soglia: {}). Nessun match.", dist, payload.threshold),
         }))
     }
 }
