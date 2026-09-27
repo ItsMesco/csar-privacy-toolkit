@@ -36,3 +36,5 @@ rand = "0.8"
 
 kzen-paillier = "0.4.3"
 curv-kzen = "0.10"
+
+hash-engine = {path= "../hash-engine"}

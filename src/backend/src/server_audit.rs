@@ -13,6 +13,7 @@ pub enum AuditEventType {
     ProofReceived,
     ProofVerified,
     ProofRejected,
+    CheckpointReceived,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -59,6 +60,16 @@ impl PrivacyLedger {
                 payload          TEXT NOT NULL
             );
             ",
+        )?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS client_checkpoints (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                checkpoint_ct TEXT NOT NULL,
+                received_ts TEXT NOT NULL,
+                UNIQUE(device_id, seq)
+            );",
         )?;
         Ok(Self { conn: Mutex::new(conn) }) // <-- Wrappiamo nel Mutex
     }
@@ -120,7 +131,57 @@ impl PrivacyLedger {
         let tree = MerkleTree::<MerkleSha256>::from_leaves(&leaves);
         Ok(tree.root())
     }
+    /// Ancoraggio esterno: salva una busta cifrata di checkpoint del client.
+    /// Impone seq strettamente crescente per dispositivo.
+    pub fn record_checkpoint(
+        &self,
+        device_id: &str,
+        seq: u64,
+        checkpoint_ct: &str,
+        received_ts: &str,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();  // ← AGGIUNTO lock()
+
+        let prev: Option<i64> = conn.query_row(
+            "SELECT MAX(seq) FROM client_checkpoints WHERE device_id = ?1",
+            rusqlite::params![device_id],
+            |r| r.get(0),
+        )?;
+        if let Some(p) = prev {
+            if seq as i64 <= p {
+                return Err(rusqlite::Error::InvalidParameterName(format!(
+                    "seq {} non monotona (precedente: {})", seq, p
+                )));
+            }
+        }
+        conn.execute(
+            "INSERT INTO client_checkpoints (device_id, seq, checkpoint_ct, received_ts)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![device_id, seq as i64, checkpoint_ct, received_ts],
+        )?;
+        Ok(())
+    }
+    
+    /// Restituisce (seq, ciphertext, timestamp ricezione) per dispositivo, in ordine.
+    pub fn checkpoints_for(
+        &self,
+        device_id: &str,
+    ) -> rusqlite::Result<Vec<(i64, String, String)>> {
+        let conn = self.conn.lock().unwrap();  // ← AGGIUNTO lock()
+
+        let mut stmt = conn.prepare(
+            "SELECT seq, checkpoint_ct, received_ts FROM client_checkpoints
+             WHERE device_id = ?1 ORDER BY seq",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![device_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
 }
+
 
 #[cfg(test)]
 mod tests {

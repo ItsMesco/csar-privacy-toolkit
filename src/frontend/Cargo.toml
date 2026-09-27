@@ -15,14 +15,21 @@ pdqhash = "0.1.1"
 rs_merkle = "1.5"
 
 # Zero-Knowledge Proofs (arkworks / Groth16)
-ark-ff = "0.6"
-ark-ec = "0.6"
+# Zero-Knowledge Proofs (arkworks / Groth16) - OTTIMIZZATO
+ark-ff = { version = "0.6", features = ["parallel", "asm"] }
+ark-ec = { version = "0.6", features = ["parallel"] }
+ark-poly = { version = "0.6", features = ["parallel"] }
 ark-relations = "0.6"
-ark-r1cs-std = "0.6"
-ark-groth16 = "0.6"
+ark-r1cs-std = { version = "0.6", features = ["parallel"] }
+ark-groth16 = { version = "0.6", features = ["parallel"] }
 ark-snark = "0.6"
 ark-bn254 = { version = "0.6", features = ["curve"] }
-ark-std = "0.6"
+ark-std = { version = "0.6", features = ["parallel"] }
+ark-serialize = "0.6.0"
+ark-crypto-primitives = { version = "0.6", features = ["crh", "constraints", "parallel"] }
+
+# Parallelism backend
+rayon = "1.12"
 
 #phe
 kzen-paillier = "0.4.3"
@@ -42,10 +49,18 @@ bincode = "1.3"
 uuid = { version = "1.25.0", features = ["v4"] }
 tokio = { version= "1.53.1", features = ["full"] }
 base64 = "0.23.1"
-ark-serialize = "0.6.0"
+
 serde_json = "1.0.151"
 sha256 = "1.6.0"
-ark-crypto-primitives = { version = "0.6", features = ["crh", "constraints"] }
+
+
+[[bin]]
+name = "scalability"
+path = "src/bin/scalability.rs"
+
+[[bin]]
+name = "e2e_dataset"
+path = "src/bin/e2e_dataset.rs"
 
 [features]
 default = ["std"]

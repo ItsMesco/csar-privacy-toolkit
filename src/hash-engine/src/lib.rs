@@ -1,4 +1,5 @@
 pub mod db_merkle;
+pub mod variants;
 
 use image::EncodableLayout;
 use serde::{Deserialize, Serialize};

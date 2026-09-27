@@ -3,8 +3,9 @@ mod local_privacy_ledger;
 mod metrics;
 mod scanner;
 mod identity;
+mod ledger_uploader;
 
-use comparison::{available_strategies, build_strategy, ComparisonContext, ComparisonStrategy};
+use comparison::{available_strategies, build_strategy, ComparisonContext,};
 use hash_engine::db_merkle::{db_merkle_root, merkle_path};
 use hash_engine::{compute_pdq_from_path, PdqHash};
 use identity::InfractionIdentity;
@@ -14,7 +15,7 @@ use metrics::current_rss_kb;
 use ark_std::rand::thread_rng;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::Utc;
-use rsa::{RsaPrivateKey, RsaPublicKey};
+use rsa::{Oaep, RsaPrivateKey, RsaPublicKey};
 use std::time::{Duration, Instant};
 use std::fs;
 use uuid::Uuid;
@@ -66,6 +67,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("      ✓ RAM post-setup globale: {} KB (~{} MB)\n",
              ram_after_setup, ram_after_setup / 1024);
 
+    // --- FASE 0.5: task di ancoraggio checkpoint (rateo costante) ---
+    let device_id = identity.device_id.clone();
+    let uploader = ledger_uploader::CheckpointUploader::new(
+        device_id.clone(),
+        "super-secret-device-token-123",
+        "demo_ledger.db",
+        authority_pub.clone(),
+    );
+    let period_secs: u64 = std::env::var("ANCHOR_PERIOD_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(600); // 10 minuti in produzione
+    let anchor_handle = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(period_secs));
+        let mut seq = 0u64;
+        loop {
+            ticker.tick().await;
+            seq += 1;
+            if let Err(e) = uploader.tick(seq, db_root).await {
+                println!("      [anchor] upload fallito: {}", e);
+            }
+        }
+    });
+    println!("      ✓ Task di ancoraggio avviato (periodo={}s)\n", period_secs);
     // --- FASE 1: Run comparativa di TUTTE le strategie registrate ---
     println!("[1/4] Run comparativa delle strategie registrate...");
     let mut reports: Vec<StrategyReport> = Vec::new();
@@ -260,6 +285,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("* RAM Post-Setup globale     : {} KB (~{} MB)", ram_after_setup, ram_after_setup / 1024);
     println!("* RAM Picco / Finale         : {} KB (~{} MB)", ram_peak, ram_peak / 1024);
     println!("* Spazio Disco SQLite        : {} Bytes (~{} KB)", db_size, db_size / 1024);
+    println!("==================================================\n");
+
+    // --- FASE 3: demo ancoraggio + audit dell'Autorità ---
+    println!("\n[2/4] Attesa di 2 tick di ancoraggio a rateo costante...");
+    tokio::time::sleep(std::time::Duration::from_secs(period_secs * 2 + 1)).await;
+    anchor_handle.abort();
+
+    println!("\n[3/4] Audit: l'Autorità decifra i checkpoint ancorati sul server...");
+    let audit_client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()?;
+
+    let url = format!(
+        "https://127.0.0.1:3000/api/v1/ledger/checkpoints?device_id={}",
+        device_id
+    );
+
+    let resp = audit_client
+        .get(&url)
+        .header("Authorization", "Bearer super-secret-device-token-123")
+        .send()
+        .await?;
+    let rows: Vec<ledger_uploader::CheckpointRow> = resp.json().await?;
+
+    let mut last_root: Option<[u8; 32]> = None;
+    for row in &rows {
+        let ct = BASE64.decode(&row.checkpoint_ct_b64)?;
+        let plain_bytes = authority_priv.decrypt(Oaep::new::<sha2::Sha256>(), &ct)?;
+        let cp: ledger_uploader::CheckpointPlain = bincode::deserialize(&plain_bytes)?;
+        println!(
+            "      [audit] seq={:<3} root={}… anchored_ts={}",
+            cp.seq,
+            &hex::encode(cp.merkle_root)[..8],
+            row.received_ts
+        );
+        last_root = Some(cp.merkle_root);
+    }
+
+    let local_root = LocalPrivacyLedger::open("demo_ledger.db")?.get_latest_checkpoint()?;
+    match (last_root, local_root) {
+        (Some(anchored), Some(local)) if anchored == local => {
+            println!("      ✓ Storia ancorata coerente con l'ultimo checkpoint locale");
+        }
+        _ => {
+            println!("      ✗ INCOERENZA: root ancorate e ledger locale non coincidono");
+        }
+    }
     println!("==================================================\n");
 
     Ok(())

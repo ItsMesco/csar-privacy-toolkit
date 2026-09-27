@@ -3,7 +3,7 @@ mod server_audit;
 mod db_merkle;
 use crate::db_merkle::*;
 use axum::{
-    extract::{FromRequestParts, State},
+    extract::{FromRequestParts, Query, State},
     http::{header, request::Parts, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -27,7 +27,7 @@ use server_audit::{AuditEvent, AuditEventType, PrivacyLedger};
 use curv::arithmetic::traits::Converter;
 use kzen_paillier::{Add, BigInt, DecryptionKey, Decrypt, EncryptionKey, Encrypt, Mul, Paillier, RawCiphertext, RawPlaintext};
 use std::borrow::Cow;
-
+use hash_engine;
 // ─── Auth Extractor ───────────────────────────────────────────
 pub struct AuthToken;
 
@@ -62,6 +62,20 @@ struct ZkpScanPayload {
     threshold: u32,
 }
 
+#[derive(Deserialize)]
+struct CheckpointUpload {
+    device_id: String,
+    seq: u64,
+    checkpoint_ct_b64: String,
+}
+
+#[derive(Serialize)]
+struct CheckpointRowOut {
+    seq: i64,
+    checkpoint_ct_b64: String,
+    received_ts: String,
+}
+
 // ─── Risposta al client ───────────────────────────────────────
 #[derive(Serialize)]
 struct ZkpScanResponse {
@@ -73,6 +87,7 @@ struct ZkpScanResponse {
 #[derive(Clone)]
 struct AppState {
     ledger: Arc<Mutex<PrivacyLedger>>,
+    db_hashes: Vec<[u8; 32]>,
     db_root: [u8; 32],
 }
 
@@ -86,7 +101,22 @@ async fn main() {
     let ledger = PrivacyLedger::open("server_audit.db")
         .expect("Impossibile aprire il DB del server");
 
-    let db = published_db();
+    let images_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../hash-engine/tests/images");
+    // DB reale se esiste la cartella immagini, altrimenti dummy list (prototipo)
+    let mut db: Vec<[u8; 32]> = match hash_engine::variants::build_hashes_from_dir(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../hash-engine/tests/images"),
+        &hash_engine::variants::VariantConfig::default(),
+    ) {
+        Ok(h) => { info!("✓ DB reale: {} hash (orig+varianti)", h.len()); h }
+        Err(_) => { info!("· dataset assente: uso dummy list"); published_db() }
+    };
+    // rs_merkle richiede leaf in numero potenza di 2: padding deterministico
+    // con leaf zero, inerti ai fini del matching (dH ~128 da qualsiasi hash reale).
+    let n = db.len().next_power_of_two();
+    if n != db.len() {
+        info!("· Padding Merkle: {} → {} leaf", db.len(), n);
+        db.resize(n, [0u8; 32]);
+    }
     let db_root = db_merkle_root(&db);
     let start_event = AuditEvent::new(
         AuditEventType::DatabasePublished,
@@ -97,6 +127,7 @@ async fn main() {
 
     let shared_state = Arc::new(AppState {
         ledger: Arc::new(Mutex::new(ledger)),
+        db_hashes: db.clone(),
         db_root,
     });
 
@@ -106,6 +137,8 @@ async fn main() {
         .route("/api/v1/scan/zkp", post(handle_zkp_scan))
         .route("/api/v1/scan/zkp-membership", post(handle_zkp_membership_scan))
         .route("/api/v1/scan/phe", post(handle_phe_scan))
+        .route("/api/v1/ledger/checkpoint", post(handle_checkpoint))
+        .route("/api/v1/ledger/checkpoints", get(get_checkpoints))
         .with_state(shared_state);
 
     // Carica i certificati TLS (percorsi fissi relativi alla cartella del backend)
@@ -294,10 +327,10 @@ async fn get_manifest(
 // ─── Handler: Download DB (già esistente) ─────────────────────
 async fn download_db(
     _auth: AuthToken,
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
     info!("📥 Download DB richiesto");
-    let hashes: Vec<String> = published_db().iter().map(hex::encode).collect();
+    let hashes: Vec<String> = state.db_hashes.iter().map(hex::encode).collect();
     let payload = serde_json::json!({
         "version": "v1.0.0-csam-list",
         "hashes": hashes,
@@ -530,4 +563,93 @@ async fn handle_phe_scan(
             message: format!("Distanza di Hamming: {} (soglia: {}). Nessun match.", dist, payload.threshold),
         }))
     }
+}
+
+// ─── Handler: ancoraggio checkpoint ledger ─────────────────────
+async fn handle_checkpoint(
+    _auth: AuthToken,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<CheckpointUpload>,
+) -> impl IntoResponse {
+    let ct_bytes = match BASE64.decode(&payload.checkpoint_ct_b64) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ZkpScanResponse {
+                    valid: false,
+                    message: format!("Decodifica base64 checkpoint fallita: {}", e),
+                }),
+            )
+        }
+    };
+    // Una busta RSA-2048 è esattamente 256 byte
+    if ct_bytes.len() != 256 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ZkpScanResponse {
+                valid: false,
+                message: format!("Dimensione busta cifrata non valida: {} byte", ct_bytes.len()),
+            }),
+        );
+    }
+
+    let received_ts = chrono::Utc::now().to_rfc3339();
+    {
+        let ledger = state.ledger.lock().unwrap();
+        if let Err(e) = ledger.record_checkpoint(
+            &payload.device_id,
+            payload.seq,
+            &payload.checkpoint_ct_b64,
+            &received_ts,
+        ) {
+            return (
+                StatusCode::CONFLICT,
+                Json(ZkpScanResponse {
+                    valid: false,
+                    message: format!("Seq non monotona o duplicata: {}", e),
+                }),
+            );
+        }
+        // Il server NON può leggere il contenuto: nell'audit finisce solo device+seq
+        let _ = ledger.append_event(&AuditEvent::new(
+            AuditEventType::CheckpointReceived,
+            "v1.0.0-csam-list",
+            format!(
+                "device={} seq={} (contenuto cifrato verso l'Autorità)",
+                payload.device_id, payload.seq
+            ),
+        ));
+    }
+
+    (
+        StatusCode::OK,
+        Json(ZkpScanResponse {
+            valid: true,
+            message: format!("Checkpoint seq={} ancorato", payload.seq),
+        }),
+    )
+}
+
+async fn get_checkpoints(
+    _auth: AuthToken,
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let device_id = match params.get("device_id") {
+        Some(d) => d.clone(),
+        None => return (StatusCode::BAD_REQUEST, Json(Vec::<CheckpointRowOut>::new())),
+    };
+    let ledger = state.ledger.lock().unwrap();
+    let rows = ledger
+        .checkpoints_for(&device_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(seq, ct, ts)| CheckpointRowOut {
+            seq,
+            checkpoint_ct_b64: ct,
+            received_ts: ts,
+        })
+        .collect::<Vec<_>>();
+    (StatusCode::OK, Json(rows))
 }
